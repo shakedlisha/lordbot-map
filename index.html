@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="robots" content="noindex, nofollow">
+<title>מפת מלונות</title>
+<!--
+  Lord Travel bot - hotel map (a Telegram Mini App). The bot puts the hotels of the list the agent is looking at in the link
+  itself (after #d=, compressed), so this page has no data and no server: what it shows exists only in that link.
+  Tapping "choose" goes back to the bot with /start mp<map>_<n>, and the bot continues to that hotel's rooms.
+-->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako_inflate.min.js"></script>
+<style>
+  :root {
+    --bg: #ffffff; --text: #1a1a1a; --muted: #6b7280; --card: #ffffff; --line: #e5e7eb;
+    --pin: #003b95; --pin-text: #ffffff; --pref: #1d6fd8; --sel: #e8590c; --btn: #1a7f37; --btn-text: #ffffff;
+    --shadow: 0 2px 10px rgba(0,0,0,.18);
+  }
+  body.dark {
+    --bg: #17212b; --text: #f1f1f1; --muted: #9aa4b2; --card: #1f2b38; --line: #2c3a49;
+    --pin: #2f6fdc; --pref: #4f8ff7; --shadow: 0 2px 12px rgba(0,0,0,.5);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 15px/1.4 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+  #map { position: fixed; inset: 0; }
+  .top { position: fixed; top: 10px; left: 10px; right: 10px; z-index: 1000; display: flex; gap: 8px; flex-wrap: wrap;
+    pointer-events: none; }
+  .chip { background: var(--card); color: var(--text); border-radius: 999px; padding: 6px 12px; box-shadow: var(--shadow);
+    font-size: 13px; pointer-events: auto; max-width: 100%; }
+  .chip b { font-weight: 700; }
+  .pin { background: var(--pin); color: var(--pin-text); font-weight: 700; font-size: 12.5px; padding: 3px 7px; border-radius: 6px;
+    white-space: nowrap; box-shadow: 0 1px 4px rgba(0,0,0,.35); border: 1.5px solid #fff; transform: translate(-50%, -100%);
+    position: absolute; left: 0; top: 0; direction: ltr; }
+  .pin::after { content: ""; position: absolute; left: 50%; bottom: -6px; margin-left: -5px; border: 5px solid transparent;
+    border-top-color: var(--pin); border-bottom: 0; }
+  .pin.pref { background: var(--pref); }
+  .pin.pref::after { border-top-color: var(--pref); }
+  .pin.sel { background: var(--sel); z-index: 999; transform: translate(-50%, -100%) scale(1.12); }
+  .pin.sel::after { border-top-color: var(--sel); }
+  .leaflet-div-icon { background: none; border: 0; }
+  .card { position: fixed; left: 10px; right: 10px; bottom: 12px; z-index: 1001; background: var(--card); border-radius: 14px;
+    box-shadow: var(--shadow); padding: 14px 14px 12px; display: none; }
+  .card.on { display: block; }
+  .card h2 { margin: 0 0 4px; font-size: 16px; direction: ltr; text-align: right; }
+  .row { color: var(--muted); font-size: 13.5px; margin: 2px 0; }
+  .rating { display: inline-block; background: var(--pin); color: #fff; border-radius: 6px 6px 6px 0; padding: 1px 6px;
+    font-weight: 700; font-size: 13px; margin-left: 4px; direction: ltr; }
+  .price { font-size: 18px; font-weight: 800; margin: 6px 0 2px; direction: ltr; text-align: right; }
+  .price small { font-size: 13px; font-weight: 400; color: var(--muted); }
+  .btns { display: flex; gap: 8px; margin-top: 10px; }
+  .btn { flex: 1; border: 0; border-radius: 10px; padding: 11px; font-size: 15px; font-weight: 700; cursor: pointer;
+    background: var(--btn); color: var(--btn-text); }
+  .btn.sec { flex: 0 0 auto; background: transparent; color: var(--pin); border: 1.5px solid var(--line); font-weight: 600; }
+  .close { position: absolute; top: 8px; left: 10px; background: none; border: 0; font-size: 20px; color: var(--muted); cursor: pointer; }
+  .empty { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; text-align: center; padding: 24px;
+    z-index: 2000; background: var(--bg); }
+  .empty.on { display: flex; }
+  .near { width: 16px; height: 16px; border-radius: 50%; background: var(--sel); border: 3px solid #fff; box-shadow: var(--shadow);
+    transform: translate(-50%, -50%); position: absolute; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="top" id="top"></div>
+<div class="card" id="card"></div>
+<div class="empty" id="empty"><div>🗺️ אין כאן מלונות להציג.<br>פתח את המפה מרשימת המלונות בבוט.</div></div>
+<script>
+// A new list in the same tab (only the part after # changed): read it again.
+window.addEventListener("hashchange", function () { location.reload(); });
+(function () {
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) {
+    tg.ready();
+    tg.expand();
+    if (tg.colorScheme === "dark") document.body.classList.add("dark");
+  } else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+    document.body.classList.add("dark");
+  }
+
+  // The data: #d=<base64url of deflate-raw JSON>, made by the bot (src/bot/hotelMap.ts).
+  var data = null;
+  try {
+    var m = location.hash.match(/[#&]d=([^&]+)/);
+    if (m) {
+      var b64 = m[1].replace(/-/g, "+").replace(/_/g, "/");
+      while (b64.length % 4) b64 += "=";
+      var bin = atob(b64), bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      data = JSON.parse(pako.inflateRaw(bytes, { to: "string" }));
+    }
+  } catch (e) { data = null; }
+  if (!data || !data.h || !data.h.length) { document.getElementById("empty").classList.add("on"); return; }
+
+  var SYM = { USD: "$", EUR: "€", GBP: "£", ILS: "₪" };
+  var sym = SYM[data.cur] || "";
+  function money(n) {
+    var s = Math.round(n).toLocaleString("en-US");
+    return data.cur === "ILS" ? s + " ₪" : sym ? sym + s : s + " " + data.cur;
+  }
+  function esc(t) { return String(t).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+  function dist(km) { return km < 1 ? Math.max(50, Math.round(km * 1000 / 50) * 50) + " מ׳" : (Math.round(km * 10) / 10) + " ק״מ"; }
+
+  // hotels: [name, lat, lng, total, stars, rating10, reviews, preferredBookings, icons, kmFromPlaceOrCenter]
+  var hotels = data.h.map(function (h, i) {
+    return { i: i, name: h[0], lat: h[1], lng: h[2], total: h[3], stars: h[4], rating: h[5], reviews: h[6], pref: h[7], icons: h[8] || "", km: h[9] };
+  });
+
+  var top = document.getElementById("top");
+  top.innerHTML =
+    '<div class="chip"><b>' + esc(data.city || "") + "</b> · " + hotels.length + " מלונות" + (data.n ? " · " + data.n + " לילות" : "") + "</div>" +
+    (data.f ? '<div class="chip">🔎 ' + esc(data.f) + "</div>" : "");
+
+  var map = L.map("map", { zoomControl: false, attributionControl: true });
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+  }).addTo(map);
+
+  var bounds = [];
+  if (data.near) {
+    L.circle([data.near[0], data.near[1]], { radius: (data.near[3] || 1) * 1000, color: "#e8590c", weight: 1.5, fillOpacity: 0.06 }).addTo(map);
+    L.marker([data.near[0], data.near[1]], { icon: L.divIcon({ className: "", html: '<div class="near" title="' + esc(data.near[2]) + '"></div>' }), interactive: false }).addTo(map);
+    bounds.push([data.near[0], data.near[1]]);
+  }
+
+  var markers = [];
+  var selected = null;
+  hotels.forEach(function (h) {
+    var icon = L.divIcon({ className: "", html: '<div class="pin' + (h.pref ? " pref" : "") + '">' + (h.pref ? "💙 " : "") + money(h.total) + "</div>" });
+    var mk = L.marker([h.lat, h.lng], { icon: icon, riseOnHover: true }).addTo(map);
+    mk.on("click", function () { pick(h, mk); });
+    markers.push(mk);
+    bounds.push([h.lat, h.lng]);
+  });
+  if (bounds.length === 1) map.setView(bounds[0], 15);
+  else map.fitBounds(bounds, { padding: [40, 40], maxZoom: 16 });
+
+  var card = document.getElementById("card");
+  function pick(h, mk) {
+    if (selected) selected.getElement().querySelector(".pin").classList.remove("sel");
+    selected = mk;
+    mk.getElement().querySelector(".pin").classList.add("sel");
+    mk.setZIndexOffset(1000);
+    var perNight = data.n ? " <small>(" + money(h.total / data.n) + " ללילה)</small>" : "";
+    card.innerHTML =
+      '<button class="close" aria-label="סגור">✕</button>' +
+      "<h2>" + esc(h.name) + "</h2>" +
+      '<div class="row">' + (h.stars ? "⭐".repeat(h.stars) : "") + (h.icons ? " · " + esc(h.icons) : "") + "</div>" +
+      (h.rating ? '<div class="row"><span class="rating">' + h.rating + "</span> " + (h.reviews ? h.reviews.toLocaleString("en-US") + " ביקורות" : "") + "</div>" : "") +
+      (h.km != null ? '<div class="row">📍 ' + dist(h.km) + (data.near ? " מ-" + esc(data.near[2]) : " מהמרכז") + "</div>" : "") +
+      (h.pref ? '<div class="row">💙 ' + h.pref + " הזמנות אצלכם</div>" : "") +
+      '<div class="price">' + money(h.total) + " <small>ל-" + (data.n || "?") + " לילות</small>" + perNight + "</div>" +
+      '<div class="btns"><button class="btn" id="choose">✅ בחר את המלון הזה</button>' +
+      '<button class="btn sec" id="booking">Booking</button></div>';
+    card.classList.add("on");
+    card.querySelector(".close").onclick = function () { card.classList.remove("on"); };
+    document.getElementById("choose").onclick = function () { choose(h); };
+    document.getElementById("booking").onclick = function () {
+      var url = "https://www.booking.com/searchresults.he.html?ss=" + encodeURIComponent('"' + h.name + '"');
+      if (tg) tg.openLink(url); else window.open(url, "_blank");
+    };
+  }
+
+  // Back to the bot: /start mp<map>_<n> - the bot opens that hotel's rooms.
+  function choose(h) {
+    var link = "https://t.me/" + data.b + "?start=mp" + data.m + "_" + h.i;
+    if (tg && tg.initData) {
+      tg.openTelegramLink(link);
+      setTimeout(function () { tg.close(); }, 300);
+    } else {
+      window.location.href = link;
+    }
+  }
+
+  map.on("click", function () { card.classList.remove("on"); });
+})();
+</script>
+</body>
+</html>
