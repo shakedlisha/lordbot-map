@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="robots" content="noindex, nofollow">
+<title>לוח הטיול</title>
+<!--
+  Lord Travel bot - the trip board (a Telegram Mini App). The bot puts the trip's places, nights, hotels, flights and day titles
+  in the link itself (after #d=, compressed - src/trip/board.ts), so this page has no data and no server: what it shows exists
+  only in that link. The agent changes the nights, picks a hotel, reorders the places; 💾 שמור sends everything back to the bot at
+  once with Telegram.WebApp.sendData (the page must be opened from a reply keyboard button for that), and the bot turns it into
+  one message to the itinerary builder.
+-->
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako_inflate.min.js"></script>
+<style>
+  :root {
+    --bg: #f3f4f6; --text: #1a1a1a; --muted: #6b7280; --card: #ffffff; --line: #e5e7eb;
+    --accent: #003b95; --accent-text: #ffffff; --sel: #e8590c; --btn: #1a7f37; --btn-text: #ffffff; --chip: #e8eef9;
+    --shadow: 0 1px 6px rgba(0,0,0,.10);
+  }
+  body.dark {
+    --bg: #17212b; --text: #f1f1f1; --muted: #9aa4b2; --card: #1f2b38; --line: #2c3a49; --accent: #4f8ff7; --chip: #243447;
+    --shadow: 0 1px 8px rgba(0,0,0,.45);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.4 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+  body { padding: 12px 12px 96px; }
+  .top { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .chip { background: var(--card); border-radius: 999px; padding: 6px 12px; box-shadow: var(--shadow); font-size: 13px; }
+  .chip b { font-weight: 700; }
+  h2 { font-size: 14px; color: var(--muted); font-weight: 600; margin: 16px 4px 6px; }
+  .place { background: var(--card); border-radius: 14px; box-shadow: var(--shadow); padding: 12px; margin-bottom: 10px; }
+  .head { display: flex; align-items: center; gap: 8px; }
+  .head .name { font-weight: 800; font-size: 17px; flex: 1; }
+  .head .dates { color: var(--muted); font-size: 13px; direction: ltr; }
+  .move { display: flex; flex-direction: column; gap: 2px; }
+  .move button { width: 30px; height: 22px; border: 1px solid var(--line); background: var(--card); color: var(--text); border-radius: 6px; font-size: 12px; cursor: pointer; }
+  .move button:disabled { opacity: .3; }
+  .nights { display: flex; align-items: center; gap: 10px; margin: 10px 0 6px; }
+  .nights button { width: 40px; height: 36px; border: 0; border-radius: 10px; background: var(--chip); color: var(--text); font-size: 20px; font-weight: 700; cursor: pointer; }
+  .nights button:disabled { opacity: .3; }
+  .nights .n { min-width: 90px; text-align: center; font-weight: 700; }
+  .hotel { display: flex; align-items: flex-start; gap: 8px; padding: 8px 6px; border-top: 1px solid var(--line); cursor: pointer; }
+  .hotel .dot { width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--muted); flex: 0 0 auto; margin-top: 2px; }
+  .hotel.on .dot { border-color: var(--accent); background: var(--accent); box-shadow: inset 0 0 0 3px var(--card); }
+  .hotel .t { flex: 1; }
+  .hotel .t small { display: block; color: var(--muted); font-size: 12.5px; }
+  .none { color: var(--muted); font-size: 13px; padding: 6px; }
+  .line { background: var(--card); border-radius: 10px; padding: 8px 12px; margin-bottom: 6px; box-shadow: var(--shadow); font-size: 14px; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 14px; margin: 0 4px 6px; }
+  .save { position: fixed; left: 12px; right: 12px; bottom: 14px; border: 0; border-radius: 12px; padding: 14px; font-size: 16px; font-weight: 800;
+    background: var(--btn); color: var(--btn-text); box-shadow: var(--shadow); cursor: pointer; display: none; }
+  .save.on { display: block; }
+  .save:disabled { opacity: .5; }
+  .empty { padding: 40px 16px; text-align: center; color: var(--muted); }
+  .note { color: var(--muted); font-size: 12.5px; margin: 4px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<button class="save" id="save">💾 שמור</button>
+<script>
+window.addEventListener("hashchange", function () { location.reload(); });
+(function () {
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) {
+    tg.ready();
+    tg.expand();
+    if (tg.colorScheme === "dark") document.body.classList.add("dark");
+  } else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+    document.body.classList.add("dark");
+  }
+
+  // The data: #d=<base64url of deflate-raw JSON>, made by the bot (src/trip/board.ts).
+  var data = null;
+  try {
+    var m = location.hash.match(/[#&]d=([^&]+)/);
+    if (m) {
+      var b64 = m[1].replace(/-/g, "+").replace(/_/g, "/");
+      while (b64.length % 4) b64 += "=";
+      var bin = atob(b64), bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      data = JSON.parse(pako.inflateRaw(bytes, { to: "string" }));
+    }
+  } catch (e) { data = null; }
+  var app = document.getElementById("app");
+  if (!data || !data.p || !data.p.length) {
+    app.innerHTML = '<div class="empty">🧭 אין כאן מסלול להציג.<br>פתח/י את הלוח מהכפתור בבונה המסלולים.</div>';
+    return;
+  }
+
+  function esc(t) { return String(t).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+  // "4★" and "$1,120" keep their order inside a Hebrew line.
+  function mixed(t) { return esc(t).replace(/(\d[\d,.]*\s?[★⭐]+|[$€₪£]\s?\d[\d,.]*|\d[\d,.]*\s?[$€₪£])/g, '<span dir="ltr">$1</span>'); }
+  function nightsHe(n) { return n === 0 ? "בלי לילה" : n === 1 ? "לילה אחד" : n === 2 ? "שני לילות" : n + " לילות"; }
+  function addDays(iso, n) { var d = new Date(iso + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
+  function dm(iso) { return Number(iso.slice(8, 10)) + "." + Number(iso.slice(5, 7)); }
+  function range(from, to) { return from.slice(0, 7) === to.slice(0, 7) ? Number(from.slice(8, 10)) + "–" + dm(to) : dm(from) + "–" + dm(to); }
+
+  // places: [name, nights, dates, chosen hotel index or -1, [[hotel, detail], …]]
+  var places = data.p.map(function (p) { return { n: p[0], k: p[1], dates: p[2] || "", h: p[3], hotels: (p[4] || []).map(function (h) { return { name: h[0], detail: h[1] || "" }; }) }; });
+  var original = JSON.stringify(payload());
+  var touchedNights = false;
+
+  function payload() {
+    return { v: 1, id: data.id, p: places.map(function (p) { return { n: p.n, k: p.k, h: p.h }; }) };
+  }
+  function changed() { return JSON.stringify(payload()) !== original; }
+
+  function render() {
+    var total = places.reduce(function (s, p) { return s + p.k; }, 0);
+    var html = '<div class="top"><div class="chip" dir="ltr"><b>' + esc(data.id) + "</b></div>" +
+      (data.st ? '<div class="chip">' + esc(data.st) + "</div>" : "") +
+      '<div class="chip">' + nightsHe(total) + "</div></div>";
+    html += "<h2>המקומות לפי הסדר · לילות · מלון</h2>";
+    var cursor = data.s || null;
+    places.forEach(function (p, i) {
+      var dates = "";
+      if (cursor) { var to = addDays(cursor, p.k); dates = range(cursor, to); cursor = to; }
+      else if (p.dates) dates = p.dates + (touchedNights ? " ⟲" : "");
+      html += '<div class="place" data-i="' + i + '">' +
+        '<div class="head"><div class="move"><button data-act="up" ' + (i === 0 ? "disabled" : "") + ' aria-label="למעלה">▲</button>' +
+        '<button data-act="down" ' + (i === places.length - 1 ? "disabled" : "") + ' aria-label="למטה">▼</button></div>' +
+        '<div class="name">' + esc(p.n) + '</div><div class="dates">' + esc(dates) + "</div></div>" +
+        '<div class="nights"><button data-act="minus" ' + (p.k <= 0 ? "disabled" : "") + ">➖</button><div class=\"n\">" + nightsHe(p.k) + '</div><button data-act="plus" ' + (p.k >= 30 ? "disabled" : "") + ">➕</button></div>";
+      if (p.hotels.length) {
+        p.hotels.forEach(function (h, j) {
+          html += '<div class="hotel' + (p.h === j ? " on" : "") + '" data-act="hotel" data-j="' + j + '"><div class="dot"></div><div class="t">' + esc(h.name) + (h.detail ? "<small>" + mixed(h.detail) + "</small>" : "") + "</div></div>";
+        });
+      } else html += '<div class="none">עדיין אין מלונות למקום הזה (שלב המלונות)</div>';
+      html += "</div>";
+    });
+    if (!data.s && touchedNights) html += '<div class="note">⟲ התאריכים יחושבו מחדש אחרי השמירה.</div>';
+    if (data.f && data.f.length) {
+      html += "<h2>טיסות</h2>";
+      data.f.forEach(function (f) { html += '<div class="line">✈️ ' + mixed(f) + "</div>"; });
+    }
+    if (data.d && data.d.length) {
+      html += '<h2>תוכנית יומית</h2><details><summary>' + data.d.length + " ימים — לפתוח</summary>";
+      data.d.forEach(function (d) { html += '<div class="line">' + esc(d) + "</div>"; });
+      html += "</details>";
+    }
+    html += '<div class="note">שינויים כאן הם החלטות: הבוט מעדכן את המסלול והמלונות לפיהם (שלב שאושר נפתח מחדש).</div>';
+    app.innerHTML = html;
+    saveState();
+  }
+
+  app.addEventListener("click", function (ev) {
+    var el = ev.target.closest("[data-act]");
+    if (!el) return;
+    var card = el.closest(".place");
+    var i = Number(card.getAttribute("data-i"));
+    var act = el.getAttribute("data-act");
+    var p = places[i];
+    if (act === "plus" && p.k < 30) { p.k++; touchedNights = true; }
+    else if (act === "minus" && p.k > 0) { p.k--; touchedNights = true; }
+    else if (act === "up" && i > 0) { places.splice(i, 1); places.splice(i - 1, 0, p); }
+    else if (act === "down" && i < places.length - 1) { places.splice(i, 1); places.splice(i + 1, 0, p); }
+    else if (act === "hotel") { p.h = Number(el.getAttribute("data-j")); }
+    if (tg && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
+    render();
+  });
+
+  // 💾 שמור: Telegram's main button inside Telegram, the page's own button elsewhere (for a look in a desktop browser).
+  var saveBtn = document.getElementById("save");
+  function send() {
+    var json = JSON.stringify(payload());
+    if (tg && tg.initData) { tg.sendData(json); }
+    else { alert("מחוץ לטלגרם - זה מה שהיה נשלח לבוט:\n" + json); }
+  }
+  function saveState() {
+    var on = changed();
+    if (tg && tg.MainButton) {
+      tg.MainButton.setText("💾 שמור את השינויים");
+      if (on) tg.MainButton.show(); else tg.MainButton.hide();
+    } else {
+      saveBtn.classList.toggle("on", on);
+    }
+  }
+  if (tg && tg.MainButton) tg.MainButton.onClick(send);
+  saveBtn.onclick = send;
+  render();
+})();
+</script>
+</body>
+</html>
