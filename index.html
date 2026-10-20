@@ -9,6 +9,7 @@
   Lord Travel bot - hotel map (a Telegram Mini App). The bot puts the hotels of the list the agent is looking at in the link
   itself (after #d=, compressed), so this page has no data and no server: what it shows exists only in that link.
   Tapping "choose" goes back to the bot with /start mp<map>_<n>, and the bot continues to that hotel's rooms.
+  The map is Google Maps when the link brings the key (k, the bot's GOOGLE_MAPS_KEY - the page itself holds none), else OpenStreetMap.
 -->
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
@@ -27,7 +28,8 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
     font: 15px/1.4 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
-  #map { position: fixed; inset: 0; }
+  /* !important: Google Maps writes position: relative on its box, which would leave it no height. */
+  #map { position: fixed !important; inset: 0; }
   .top { position: fixed; top: 10px; left: 10px; right: 10px; z-index: 1000; display: flex; gap: 8px; flex-wrap: wrap;
     pointer-events: none; }
   .chip { background: var(--card); color: var(--text); border-radius: 999px; padding: 6px 12px; box-shadow: var(--shadow);
@@ -43,6 +45,8 @@
   .pin.sel { background: var(--sel); z-index: 999; transform: translate(-50%, -100%) scale(1.12); }
   .pin.sel::after { border-top-color: var(--sel); }
   .leaflet-div-icon { background: none; border: 0; }
+  .gm-mark { position: absolute; left: 0; top: 0; width: 0; height: 0; }
+  .gm-mark:hover { z-index: 1001; }
   .card { position: fixed; left: 10px; right: 10px; bottom: 12px; z-index: 1001; background: var(--card); border-radius: 14px;
     box-shadow: var(--shadow); padding: 14px 14px 12px; display: none; }
   .card.on { display: block; }
@@ -115,37 +119,123 @@ window.addEventListener("hashchange", function () { location.reload(); });
     '<div class="chip"><b>' + esc(data.city || "") + "</b> · " + hotels.length + " מלונות" + (data.n ? " · " + data.n + " לילות" : "") + "</div>" +
     (data.f ? '<div class="chip">🔎 ' + esc(data.f) + "</div>" : "");
 
-  var map = L.map("map", { zoomControl: false, attributionControl: true });
-  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 19,
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-  }).addTo(map);
-
-  var bounds = [];
-  if (data.near) {
-    L.circle([data.near[0], data.near[1]], { radius: (data.near[3] || 1) * 1000, color: "#e8590c", weight: 1.5, fillOpacity: 0.06 }).addTo(map);
-    L.marker([data.near[0], data.near[1]], { icon: L.divIcon({ className: "", html: '<div class="near" title="' + esc(data.near[2]) + '"></div>' }), interactive: false }).addTo(map);
-    bounds.push([data.near[0], data.near[1]]);
+  // The map: Google Maps when the link brings the key (the bot's GOOGLE_MAPS_KEY), else OpenStreetMap. Each one gives the same
+  // few things - a pin, a circle, the view over the hotels, a tap on the map itself.
+  function osmKit() {
+    var map = L.map("map", { zoomControl: false, attributionControl: true });
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+    }).addTo(map);
+    return {
+      pin: function (at, html, onClick) {
+        var mk = L.marker(at, { icon: L.divIcon({ className: "", html: html }), riseOnHover: true, interactive: !!onClick }).addTo(map);
+        if (onClick) mk.on("click", onClick);
+        return { el: function () { return mk.getElement(); }, raise: function () { mk.setZIndexOffset(1000); } };
+      },
+      circle: function (at, km) { L.circle(at, { radius: km * 1000, color: "#e8590c", weight: 1.5, fillOpacity: 0.06 }).addTo(map); },
+      fit: function (points) {
+        if (points.length === 1) map.setView(points[0], 15);
+        else map.fitBounds(points, { padding: [40, 40], maxZoom: 16 });
+      },
+      onTap: function (fn) { map.on("click", fn); },
+    };
   }
 
-  var markers = [];
-  var selected = null;
-  hotels.forEach(function (h) {
-    var icon = L.divIcon({ className: "", html: '<div class="pin' + (h.pref ? " pref" : "") + '">' + (h.pref ? "💙 " : "") + money(h.total) + "</div>" });
-    var mk = L.marker([h.lat, h.lng], { icon: icon, riseOnHover: true }).addTo(map);
-    mk.on("click", function () { pick(h, mk); });
-    markers.push(mk);
-    bounds.push([h.lat, h.lng]);
-  });
-  if (bounds.length === 1) map.setView(bounds[0], 15);
-  else map.fitBounds(bounds, { padding: [40, 40], maxZoom: 16 });
+  function googleKit(g) {
+    var map = new g.Map(document.getElementById("map"), { center: { lat: 31.5, lng: 34.8 }, zoom: 6, gestureHandling: "greedy", clickableIcons: false, disableDefaultUI: true });
+    // Our own pins (the same .pin as on OpenStreetMap) at their spot on Google's map.
+    function Mark(at, html, onClick) {
+      this.at = new g.LatLng(at[0], at[1]);
+      this.tap = onClick;
+      this.div = document.createElement("div");
+      this.div.className = "gm-mark";
+      this.div.innerHTML = html;
+      if (onClick) {
+        g.OverlayView.preventMapHitsAndGesturesFrom(this.div);
+        this.div.addEventListener("click", function (e) { e.stopPropagation(); onClick(); });
+      }
+      this.setMap(map);
+    }
+    Mark.prototype = Object.create(g.OverlayView.prototype);
+    Mark.prototype.onAdd = function () { var panes = this.getPanes(); if (panes) panes[this.tap ? "overlayMouseTarget" : "overlayLayer"].appendChild(this.div); };
+    Mark.prototype.draw = function () {
+      var p = this.getProjection() && this.getProjection().fromLatLngToDivPixel(this.at);
+      if (p) this.div.style.transform = "translate(" + p.x + "px, " + p.y + "px)";
+    };
+    Mark.prototype.onRemove = function () { this.div.remove(); };
+    return {
+      pin: function (at, html, onClick) {
+        var mk = new Mark(at, html, onClick);
+        return { el: function () { return mk.div; }, raise: function () { mk.div.style.zIndex = "1000"; } };
+      },
+      circle: function (at, km) {
+        new g.Circle({ map: map, center: { lat: at[0], lng: at[1] }, radius: km * 1000, strokeColor: "#e8590c", strokeWeight: 1.5, fillColor: "#e8590c", fillOpacity: 0.06, clickable: false });
+      },
+      fit: function (points) {
+        if (points.length === 1) {
+          map.setCenter({ lat: points[0][0], lng: points[0][1] });
+          map.setZoom(15);
+          return;
+        }
+        var b = new g.LatLngBounds();
+        points.forEach(function (p) { b.extend({ lat: p[0], lng: p[1] }); });
+        map.fitBounds(b, 40);
+        g.event.addListenerOnce(map, "idle", function () { if (map.getZoom() > 16) map.setZoom(16); });
+      },
+      onTap: function (fn) { map.addListener("click", fn); },
+    };
+  }
+
+  // Google's script, then its map; a key Google refuses (or no answer) - OpenStreetMap, once.
+  function loadGoogle(key, ok, bad) {
+    window.gm_authFailure = bad;
+    window.__mapReady = function () {
+      Promise.all([google.maps.importLibrary("maps"), google.maps.importLibrary("core")]).then(function () { ok(googleKit(google.maps)); }, bad);
+    };
+    var js = document.createElement("script");
+    js.src = "https://maps.googleapis.com/maps/api/js?key=" + encodeURIComponent(key) + "&v=weekly&loading=async&language=he&region=IL&callback=__mapReady";
+    js.async = true;
+    js.onerror = bad;
+    document.head.appendChild(js);
+  }
 
   var card = document.getElementById("card");
+  var selected = null;
+  function draw(kit) {
+    selected = null;
+    card.classList.remove("on");
+    var bounds = [];
+    if (data.near) {
+      kit.circle([data.near[0], data.near[1]], data.near[3] || 1);
+      kit.pin([data.near[0], data.near[1]], '<div class="near" title="' + esc(data.near[2]) + '"></div>');
+      bounds.push([data.near[0], data.near[1]]);
+    }
+    hotels.forEach(function (h) {
+      var mk = kit.pin([h.lat, h.lng], '<div class="pin' + (h.pref ? " pref" : "") + '">' + (h.pref ? "💙 " : "") + money(h.total) + "</div>", function () { pick(h, mk); });
+      bounds.push([h.lat, h.lng]);
+    });
+    kit.fit(bounds);
+    kit.onTap(function () { card.classList.remove("on"); });
+  }
+  var fellBack = false;
+  function osm() {
+    if (fellBack) return;
+    fellBack = true;
+    // A Google map already on the page (its key refused afterwards): a clean box for OpenStreetMap.
+    var old = document.getElementById("map"), box = document.createElement("div");
+    box.id = "map";
+    old.parentNode.replaceChild(box, old);
+    draw(osmKit());
+  }
+  if (data.k) loadGoogle(data.k, draw, osm);
+  else osm();
+
   function pick(h, mk) {
-    if (selected) selected.getElement().querySelector(".pin").classList.remove("sel");
+    if (selected) selected.el().querySelector(".pin").classList.remove("sel");
     selected = mk;
-    mk.getElement().querySelector(".pin").classList.add("sel");
-    mk.setZIndexOffset(1000);
+    mk.el().querySelector(".pin").classList.add("sel");
+    mk.raise();
     var perNight = data.n ? " <small>(" + money(h.total / data.n) + " ללילה)</small>" : "";
     card.innerHTML =
       '<button class="close" aria-label="סגור">✕</button>' +
@@ -177,7 +267,6 @@ window.addEventListener("hashchange", function () { location.reload(); });
     }
   }
 
-  map.on("click", function () { card.classList.remove("on"); });
 })();
 </script>
 </body>
